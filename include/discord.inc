@@ -39,6 +39,67 @@ INTENT_MESSAGE_CONTENT          equ (1 << 15)
 INTENTS_DEFAULT equ (INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_MESSAGE_CONTENT)
 
 ; ============================================================
+; Interaction types (Interaction.type)
+; ============================================================
+INTERACTION_TYPE_PING                   equ 1
+INTERACTION_TYPE_APPLICATION_COMMAND    equ 2
+INTERACTION_TYPE_MESSAGE_COMPONENT      equ 3
+INTERACTION_TYPE_AUTOCOMPLETE           equ 4
+INTERACTION_TYPE_MODAL_SUBMIT           equ 5
+
+; ============================================================
+; Interaction callback (response) types
+; ============================================================
+INTERACTION_CALLBACK_PONG                       equ 1
+INTERACTION_CALLBACK_CHANNEL_MESSAGE            equ 4   ; reply with a message
+INTERACTION_CALLBACK_DEFERRED_CHANNEL_MESSAGE   equ 5   ; ack, edit later
+INTERACTION_CALLBACK_DEFERRED_UPDATE_MESSAGE    equ 6
+INTERACTION_CALLBACK_UPDATE_MESSAGE             equ 7
+INTERACTION_CALLBACK_AUTOCOMPLETE_RESULT        equ 8
+INTERACTION_CALLBACK_MODAL                      equ 9
+
+; ============================================================
+; Application command types and option types
+; ============================================================
+APPLICATION_COMMAND_CHAT_INPUT          equ 1
+APPLICATION_COMMAND_USER                equ 2
+APPLICATION_COMMAND_MESSAGE             equ 3
+
+CMD_OPTION_SUB_COMMAND                  equ 1
+CMD_OPTION_SUB_COMMAND_GROUP            equ 2
+CMD_OPTION_STRING                       equ 3
+CMD_OPTION_INTEGER                      equ 4
+CMD_OPTION_BOOLEAN                      equ 5
+CMD_OPTION_USER                         equ 6
+CMD_OPTION_CHANNEL                      equ 7
+CMD_OPTION_ROLE                         equ 8
+CMD_OPTION_MENTIONABLE                  equ 9
+CMD_OPTION_NUMBER                       equ 10
+CMD_OPTION_ATTACHMENT                   equ 11
+
+; ============================================================
+; Message flags / channel types / activity types
+; ============================================================
+MESSAGE_FLAG_CROSSPOSTED                equ (1 << 0)
+MESSAGE_FLAG_SUPPRESS_EMBEDS            equ (1 << 2)
+MESSAGE_FLAG_EPHEMERAL                  equ (1 << 6)   ; 64
+
+CHANNEL_TYPE_GUILD_TEXT                 equ 0
+CHANNEL_TYPE_DM                         equ 1
+CHANNEL_TYPE_GUILD_VOICE                equ 2
+CHANNEL_TYPE_GROUP_DM                   equ 3
+CHANNEL_TYPE_GUILD_CATEGORY             equ 4
+CHANNEL_TYPE_GUILD_ANNOUNCEMENT         equ 5
+CHANNEL_TYPE_PUBLIC_THREAD              equ 11
+CHANNEL_TYPE_PRIVATE_THREAD             equ 12
+
+ACTIVITY_TYPE_PLAYING                   equ 0
+ACTIVITY_TYPE_STREAMING                 equ 1
+ACTIVITY_TYPE_LISTENING                 equ 2
+ACTIVITY_TYPE_WATCHING                  equ 3
+ACTIVITY_TYPE_COMPETING                 equ 5
+
+; ============================================================
 ; Discord API Constants
 ; ============================================================
 DISCORD_API_VERSION             equ 10
@@ -50,6 +111,25 @@ MAX_CHANNEL_ID_LEN              equ 32
 MAX_URL_LEN                     equ 512
 MAX_COMMAND_NAME                equ 32
 MAX_COMMANDS                    equ 64
+MAX_EVENTS                      equ 64
+MAX_INTERACTION_CMDS            equ 64
+MAX_SESSION_ID_LEN              equ 128
+MAX_RESUME_URL_LEN              equ 256
+MAX_ACTIVITY_LEN                equ 256
+
+; ============================================================
+; Reconnection / backoff tuning
+; ============================================================
+MAX_RECONNECT_ATTEMPTS          equ 10      ; give up after this many consecutive failures
+RECONNECT_BASE_MS               equ 1000    ; first backoff delay
+RECONNECT_MAX_MS                equ 30000   ; backoff cap
 
 ; Command prefix
 DEFAULT_PREFIX_CHAR             equ '!'
+
+; ============================================================
+; Environment variable names (defined in bot.asm)
+; ============================================================
+; DISCORD_TOKEN    - bot token (required)
+; DISCORD_INTENTS  - integer gateway intents bitmask (optional)
+; DISCORD_ACTIVITY - presence activity text (optional)

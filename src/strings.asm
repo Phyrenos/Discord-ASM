@@ -379,3 +379,229 @@ asm_from_wide:
     mov rsp, rbp
     pop rbp
     ret
+
+; ============================================================
+; asm_strcat_char - Append a single byte (+ null) to a string
+; rcx = dst (null-terminated), dl = char to append
+; Returns: rax = dst
+; ============================================================
+asm_strcat_char:
+    mov rax, rcx
+.find:
+    cmp byte [rcx], 0
+    je .append
+    inc rcx
+    jmp .find
+.append:
+    mov [rcx], dl
+    mov byte [rcx+1], 0
+    ret
+
+; ============================================================
+; asm_json_escape - Copy a UTF-8 string into dst, escaping it for embedding
+; inside a JSON string literal. Escapes " \ \n \r \t and other control chars
+; (<0x20) as \u00XX. Bytes >= 0x20 (incl. UTF-8 multibyte) pass through.
+; rcx = src, rdx = dst, r8 = dst buffer size (in bytes, includes room for null)
+; Returns: rax = number of bytes written (excluding null)
+; ============================================================
+asm_json_escape:
+    push rsi
+    push rdi
+    push rbx
+    mov rsi, rcx            ; src
+    mov rdi, rdx            ; dst
+    test r8, r8
+    jz .empty
+    dec r8                  ; reserve space for the null terminator
+    xor rbx, rbx            ; bytes written / write index
+.loop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .done
+    cmp al, '"'
+    je .esc_quote
+    cmp al, 0x5C
+    je .esc_backslash
+    cmp al, 10
+    je .esc_n
+    cmp al, 13
+    je .esc_r
+    cmp al, 9
+    je .esc_t
+    cmp al, 0x20
+    jb .esc_u
+    ; normal byte
+    cmp rbx, r8
+    jae .done
+    mov [rdi+rbx], al
+    inc rbx
+    inc rsi
+    jmp .loop
+
+.esc_quote:
+    mov al, '"'
+    jmp .emit_two
+.esc_backslash:
+    mov al, 0x5C
+    jmp .emit_two
+.esc_n:
+    mov al, 'n'
+    jmp .emit_two
+.esc_r:
+    mov al, 'r'
+    jmp .emit_two
+.esc_t:
+    mov al, 't'
+.emit_two:
+    ; emit backslash + al
+    mov rcx, rbx
+    add rcx, 2
+    cmp rcx, r8
+    ja .done
+    mov byte [rdi+rbx], 0x5C
+    mov [rdi+rbx+1], al
+    add rbx, 2
+    inc rsi
+    jmp .loop
+
+.esc_u:
+    ; emit \u00XX (6 bytes) for control chars
+    mov rcx, rbx
+    add rcx, 6
+    cmp rcx, r8
+    ja .done
+    mov byte [rdi+rbx], 0x5C
+    mov byte [rdi+rbx+1], 'u'
+    mov byte [rdi+rbx+2], '0'
+    mov byte [rdi+rbx+3], '0'
+    movzx eax, byte [rsi]
+    shr eax, 4
+    and eax, 0x0F
+    cmp al, 10
+    jb .u_hi_dig
+    add al, 'a'-10
+    jmp .u_hi_done
+.u_hi_dig:
+    add al, '0'
+.u_hi_done:
+    mov [rdi+rbx+4], al
+    movzx eax, byte [rsi]
+    and eax, 0x0F
+    cmp al, 10
+    jb .u_lo_dig
+    add al, 'a'-10
+    jmp .u_lo_done
+.u_lo_dig:
+    add al, '0'
+.u_lo_done:
+    mov [rdi+rbx+5], al
+    add rbx, 6
+    inc rsi
+    jmp .loop
+
+.done:
+    mov byte [rdi+rbx], 0
+    mov rax, rbx
+    pop rbx
+    pop rdi
+    pop rsi
+    ret
+.empty:
+    xor eax, eax
+    pop rbx
+    pop rdi
+    pop rsi
+    ret
+
+; ============================================================
+; asm_url_encode - Percent-encode a UTF-8 string for use in a URL path/segment.
+; Unreserved chars (A-Z a-z 0-9 - _ . ~) pass through; everything else becomes
+; %XX with uppercase hex. Used for reaction emoji and path components.
+; rcx = src, rdx = dst, r8 = dst buffer size (includes room for null)
+; Returns: rax = number of bytes written (excluding null)
+; ============================================================
+asm_url_encode:
+    push rsi
+    push rdi
+    push rbx
+    mov rsi, rcx
+    mov rdi, rdx
+    test r8, r8
+    jz .uempty
+    dec r8                  ; reserve null
+    xor rbx, rbx
+.uloop:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .udone
+    cmp al, '-'
+    je .pass
+    cmp al, '_'
+    je .pass
+    cmp al, '.'
+    je .pass
+    cmp al, '~'
+    je .pass
+    cmp al, '0'
+    jb .pct
+    cmp al, '9'
+    jbe .pass
+    cmp al, 'A'
+    jb .pct
+    cmp al, 'Z'
+    jbe .pass
+    cmp al, 'a'
+    jb .pct
+    cmp al, 'z'
+    jbe .pass
+    ; fall through to percent-encode
+.pct:
+    mov rcx, rbx
+    add rcx, 3
+    cmp rcx, r8
+    ja .udone
+    mov byte [rdi+rbx], '%'
+    movzx eax, byte [rsi]
+    shr eax, 4
+    and eax, 0x0F
+    cmp al, 10
+    jb .p_hi_dig
+    add al, 'A'-10
+    jmp .p_hi_done
+.p_hi_dig:
+    add al, '0'
+.p_hi_done:
+    mov [rdi+rbx+1], al
+    movzx eax, byte [rsi]
+    and eax, 0x0F
+    cmp al, 10
+    jb .p_lo_dig
+    add al, 'A'-10
+    jmp .p_lo_done
+.p_lo_dig:
+    add al, '0'
+.p_lo_done:
+    mov [rdi+rbx+2], al
+    add rbx, 3
+    inc rsi
+    jmp .uloop
+.pass:
+    cmp rbx, r8
+    jae .udone
+    mov [rdi+rbx], al
+    inc rbx
+    inc rsi
+    jmp .uloop
+.udone:
+    mov byte [rdi+rbx], 0
+    mov rax, rbx
+    pop rbx
+    pop rdi
+    pop rsi
+    ret
+.uempty:
+    xor eax, eax
+    pop rbx
+    pop rdi
+    pop rsi
+    ret

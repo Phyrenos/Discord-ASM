@@ -16,9 +16,11 @@ section .data
         dw 'A','S','M',',',' ','v','1','.','0',')', 0
 
     ; HTTP methods (wide strings)
-    w_method_GET:   dw 'G','E','T', 0
-    w_method_POST:  dw 'P','O','S','T', 0
-    w_method_PUT:   dw 'P','U','T', 0
+    w_method_GET:    dw 'G','E','T', 0
+    w_method_POST:   dw 'P','O','S','T', 0
+    w_method_PUT:    dw 'P','U','T', 0
+    w_method_DELETE: dw 'D','E','L','E','T','E', 0
+    w_method_PATCH:  dw 'P','A','T','C','H', 0
 
     ; Gateway host (wide string)
     w_gateway_host: dw 'g','a','t','e','w','a','y','.','d','i','s','c','o','r','d','.','g','g', 0
@@ -99,6 +101,7 @@ http_connect:
 ; ============================================================
 section .bss
     http_response_len: resq 1
+    g_http_status:     resd 1   ; HTTP status code from the last http_request
 
 section .text
 http_request:
@@ -175,6 +178,20 @@ http_request:
     test eax, eax
     jz .close_request
 
+    ; Query the HTTP status code into g_http_status
+    mov dword [rbp-100], 0          ; status output (DWORD)
+    mov dword [rbp-104], 4          ; buffer length
+    mov rcx, [rbp-56]               ; hRequest
+    mov edx, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER
+    xor r8, r8                      ; name by index
+    lea r9, [rbp-100]               ; &statusBuffer
+    lea rax, [rbp-104]
+    mov [rsp+32], rax               ; &bufferLength
+    mov qword [rsp+40], 0           ; &index = NULL
+    call WinHttpQueryHeaders
+    mov eax, dword [rbp-100]
+    mov dword [g_http_status], eax
+
     ; Allocate response buffer
     call GetProcessHeap
     mov [rbp-64], rax      ; heap handle
@@ -237,6 +254,7 @@ http_request:
 .error:
     xor eax, eax
     mov qword [http_response_len], 0
+    mov dword [g_http_status], 0
 
 .done:
     mov rsp, rbp

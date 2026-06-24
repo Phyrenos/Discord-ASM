@@ -35,14 +35,27 @@ section .data
     msg_cmd_reg:    db "[Bot] Registered command: !", 0
     msg_newline:    db 10, 0
 
-    ; Environment variable name
-    env_token_name: db "DISCORD_TOKEN", 0
+    ; Environment variable names
+    env_token_name:    db "DISCORD_TOKEN", 0
+    env_intents_name:  db "DISCORD_INTENTS", 0
+    env_activity_name: db "DISCORD_ACTIVITY", 0
+    env_appid_name:    db "DISCORD_APP_ID", 0
+    env_guildid_name:  db "DISCORD_GUILD_ID", 0
+
+    ; Default presence activity text (overridable via DISCORD_ACTIVITY)
+    default_activity:  db "Made in discord ASM https://github.com/Phyrenos/Discord-ASM/", 0
+
+    msg_intents:       db "[Bot] Intents: ", 0
+    msg_activity:      db "[Bot] Activity: ", 0
 
 
 
 section .bss
     bot_token:      resb MAX_TOKEN_LEN  ; Bot token from environment
     cmd_resp_buf:   resb 512            ; Buffer for building command responses
+    g_activity:     resb MAX_ACTIVITY_LEN ; Presence activity text (read by gateway.asm)
+    intents_env_buf:resb 32             ; Raw DISCORD_INTENTS env value
+    g_intents_val:  resq 1              ; Resolved intents bitmask
 
 ; ============================================================
 ; Text section - All code
@@ -52,11 +65,23 @@ section .text
 ; Include all source modules
 %include "strings.asm"
 %include "json.asm"
+%include "jsonbuild.asm"
 %include "http.asm"
+%include "rest_core.asm"
 %include "heartbeat.asm"
 %include "commands.asm"
 %include "rest.asm"
+%include "rest_messages.asm"
+%include "rest_channels.asm"
+%include "rest_guilds.asm"
+%include "rest_users.asm"
+%include "rest_webhooks.asm"
+%include "rest_misc.asm"
+%include "rest_app_commands.asm"
 %include "gateway.asm"
+%include "gateway_send.asm"
+%include "events.asm"
+%include "interactions.asm"
 
 ; ============================================================
 ; print_console - Print a null-terminated string to stdout
@@ -217,12 +242,86 @@ main:
     call print_console
     call register_all_commands
 
+    ; Register gateway event handlers
+    call register_all_events
+
+    ; Register slash-command handlers + INTERACTION_CREATE handler
+    call register_all_interactions
+
+    ; --- Optional: application id / guild id for slash commands ---
+    lea rcx, [env_appid_name]
+    lea rdx, [g_application_id]
+    mov r8, 64
+    call get_env_var
+    test eax, eax
+    jz .appid_done
+    lea rcx, [g_application_id]
+    call strip_quotes
+.appid_done:
+    lea rcx, [env_guildid_name]
+    lea rdx, [g_guild_id]
+    mov r8, 64
+    call get_env_var
+    test eax, eax
+    jz .guildid_done
+    lea rcx, [g_guild_id]
+    call strip_quotes
+.guildid_done:
+
+    ; --- Resolve presence activity (DISCORD_ACTIVITY env, else default) ---
+    lea rcx, [env_activity_name]
+    lea rdx, [g_activity]
+    mov r8, MAX_ACTIVITY_LEN
+    call get_env_var
+    test eax, eax
+    jz .activity_default
+    lea rcx, [g_activity]      ; env may wrap the value in quotes
+    call strip_quotes
+    jmp .activity_done
+.activity_default:
+    lea rcx, [g_activity]
+    lea rdx, [default_activity]
+    call asm_strcpy
+.activity_done:
+    lea rcx, [msg_activity]
+    call print_console
+    lea rcx, [g_activity]
+    call print_console
+    lea rcx, [msg_newline]
+    call print_console
+
+    ; --- Resolve intents (DISCORD_INTENTS env, else INTENTS_DEFAULT) ---
+    lea rcx, [env_intents_name]
+    lea rdx, [intents_env_buf]
+    mov r8, 32
+    call get_env_var
+    test eax, eax
+    jz .intents_default
+    lea rcx, [intents_env_buf]
+    call strip_quotes
+    lea rcx, [intents_env_buf]
+    call asm_str_to_int
+    mov [g_intents_val], rax
+    jmp .intents_done
+.intents_default:
+    mov qword [g_intents_val], INTENTS_DEFAULT
+.intents_done:
+    lea rcx, [msg_intents]
+    call print_console
+    mov rcx, [g_intents_val]
+    lea rdx, [intents_env_buf]
+    call asm_itoa
+    lea rcx, [intents_env_buf]
+    call print_console
+    lea rcx, [msg_newline]
+    call print_console
+
     ; Start gateway connection (blocks until disconnect)
     lea rcx, [msg_starting]
     call print_console
 
     lea rcx, [bot_token]
-    mov rdx, INTENTS_DEFAULT
+    mov rdx, [g_intents_val]
     call gateway_connect
 
     ; Shutdown

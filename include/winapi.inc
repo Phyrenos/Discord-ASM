@@ -40,6 +40,7 @@ extern WinHttpWebSocketReceive
 extern WinHttpWebSocketQueryCloseStatus
 extern WinHttpCloseHandle
 extern WinHttpSetStatusCallback
+extern WinHttpQueryHeaders
 
 ; ============================================================
 ; Constants
@@ -70,6 +71,11 @@ WINHTTP_FLAG_SECURE                  equ 0x00800000
 ; WinHTTP option constants
 WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET equ 114
 WINHTTP_OPTION_SECURE_PROTOCOLS      equ 84
+
+; WinHttpQueryHeaders info levels / flags
+WINHTTP_QUERY_STATUS_CODE            equ 19
+WINHTTP_QUERY_FLAG_NUMBER            equ 0x20000000
+WINHTTP_NO_HEADER_INDEX              equ 0
 
 ; WinHTTP secure protocols
 WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2  equ 0x00000800

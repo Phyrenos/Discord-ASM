@@ -1,10 +1,29 @@
 ; gateway.asm - Discord Gateway WebSocket connection and event handling
+;
+; Compatibility / robustness:
+;   * Auto-reconnect: gateway_connect is an outer loop. Instead of exiting on
+;     op 7 (RECONNECT), op 9 (INVALID_SESSION), a CLOSE frame, a receive error,
+;     or a heartbeat-watchdog trip, it tears the session down and reconnects
+;     with exponential backoff (capped). Truly fatal close codes (bad token,
+;     bad intents, ...) stop instead of looping forever.
+;   * RESUME: READY supplies session_id (and resume_gateway_url). On a
+;     recoverable disconnect we send op 6 RESUME to replay missed events; if
+;     the gateway rejects it (INVALID_SESSION) we fall back to a fresh IDENTIFY.
+;   * Presence: IDENTIFY advertises an activity ("Playing <activity>") and an
+;     online status.
 
 section .data
     ; Identify payload parts (built manually without sprintf)
     identify_p1: db '{"op":2,"d":{"token":"', 0
     identify_p2: db '","intents":', 0
-    identify_p3: db ',"properties":{"os":"windows","browser":"asm-discord","device":"asm-discord"}}}', 0
+    identify_p3: db ',"properties":{"os":"windows","browser":"asm-discord","device":"asm-discord"},"presence":{"activities":[{"name":"', 0
+    identify_p4: db '","type":0}],"status":"online","afk":false}}}', 0
+
+    ; Resume payload parts: {"op":6,"d":{"token":"..","session_id":"..","seq":N}}
+    resume_p1:   db '{"op":6,"d":{"token":"', 0
+    resume_p2:   db '","session_id":"', 0
+    resume_p3:   db '","seq":', 0
+    resume_p4:   db '}}', 0
 
     ; Log messages
     gw_connecting_msg:  db "[Gateway] Connecting to Discord Gateway...", 10, 0
@@ -13,12 +32,18 @@ section .data
     gw_identify_msg:    db "[Gateway] Sending Identify...", 10, 0
     gw_identify_ok_msg: db "[Gateway] Identify sent successfully", 10, 0
     gw_identify_fail:   db "[Gateway] ERROR: Identify send failed, error: ", 0
+    gw_resuming_msg:    db "[Gateway] Resuming previous session...", 10, 0
+    gw_resumed_msg:     db "[Gateway] Session RESUMED successfully", 10, 0
     gw_ready_msg:       db "[Gateway] Bot is READY!", 10, 0
     gw_dispatch_msg:    db "[Gateway] Event: ", 0
     gw_recv_msg:        db "[Gateway] Received op: ", 0
     gw_hb_ack_msg:      db "[Gateway] Heartbeat ACK received", 10, 0
-    gw_reconnect_msg:   db "[Gateway] Reconnect requested", 10, 0
+    gw_reconnect_msg:   db "[Gateway] Reconnect requested by gateway", 10, 0
     gw_invalid_msg:     db "[Gateway] Invalid session", 10, 0
+    gw_reconnecting_msg:db "[Gateway] Reconnecting, attempt ", 0
+    gw_backoff_msg:     db "[Gateway] Backing off (ms): ", 0
+    gw_giveup_msg:      db "[Gateway] Max reconnect attempts reached - giving up", 10, 0
+    gw_fatal_msg:       db "[Gateway] Fatal close code - not reconnecting", 10, 0
     gw_ws_err_msg:      db "[Gateway] WebSocket connection failed!", 10, 0
     gw_recv_err_msg:    db "[Gateway] Receive error code: ", 0
     gw_last_err_msg:    db "[Gateway] GetLastError: ", 0
@@ -32,6 +57,7 @@ section .data
     gw_payload_len_msg: db "[Gateway] Payload length: ", 0
     gw_event_mc:        db "MESSAGE_CREATE", 0
     gw_event_ready:     db "READY", 0
+    gw_event_resumed:   db "RESUMED", 0
     gw_ms_suffix:       db "ms", 10, 0
     gw_newline:         db 10, 0
 
@@ -47,6 +73,11 @@ section .data
     key_author:             db "author", 0
     key_username:           db "username", 0
     key_bot:                db "bot", 0
+    key_session_id:         db "session_id", 0
+    key_resume_url:         db "resume_gateway_url", 0
+
+    ; Key path for READY -> d.application.id (used with json_find_path)
+    ready_path_keys:        dq key_d, k_application, key_id
 
 section .bss
     gw_recv_buf:        resb MAX_WS_RECV_BUF     ; WebSocket receive buffer
@@ -64,13 +95,20 @@ section .bss
     gw_close_reason:    resb 256                  ; WebSocket close reason string
     gw_close_reason_len:resd 1                    ; close reason length
 
+    ; Session / reconnect state
+    g_session_id:       resb MAX_SESSION_ID_LEN   ; Discord session id (from READY)
+    g_resume_url:       resb MAX_RESUME_URL_LEN   ; resume_gateway_url (from READY)
+    g_can_resume:       resq 1                    ; 1 = try RESUME on next HELLO
+    g_reconnect_attempts: resq 1                  ; consecutive (re)connect failures
+
 section .text
 
 ; ============================================================
-; gateway_connect - Connect to Discord Gateway and start event loop
+; gateway_connect - Connect to Discord Gateway and run the event loop,
+; reconnecting automatically until a fatal condition or the attempt cap.
 ; rcx = bot token (UTF-8)
 ; rdx = intents (integer)
-; Does not return until connection ends
+; Does not return until the bot gives up / hits a fatal error
 ; ============================================================
 gateway_connect:
     push rbp
@@ -89,17 +127,31 @@ gateway_connect:
     test rax, rax
     jz .ws_error
 
-    ; Connect WebSocket to gateway
+    ; Initialize session / reconnect state (once)
+    mov qword [g_can_resume], 0
+    mov qword [g_reconnect_attempts], 0
+    mov qword [g_sequence_num], -1
+    mov byte [g_session_id], 0
+    mov qword [g_zombie], 0
+
+.connect_attempt:
+    ; Clear stale close status / zombie flag for this fresh connection
+    mov word [gw_close_status], 0
+    mov qword [g_zombie], 0
+
+    ; (Re)connect WebSocket to gateway
     call ws_connect
     test rax, rax
-    jz .ws_error
+    jz .connect_failed
+
+    ; Connected - reset the failure counter
+    mov qword [g_reconnect_attempts], 0
 
     ; Print connected
     lea rcx, [gw_connected_msg]
     call print_console
 
     ; === Event Loop ===
-    ; First message should be Hello (op 10)
 .recv_loop:
     ; Clear receive buffer
     lea rcx, [gw_recv_buf]
@@ -251,11 +303,19 @@ gateway_connect:
     mov rcx, [rbp-32]
     call start_heartbeat
 
-    ; Send Identify
+    ; Decide: resume an existing session, or identify fresh?
+    cmp qword [g_can_resume], 0
+    je .send_identify
+    cmp byte [g_session_id], 0
+    je .send_identify
+    jmp .send_resume
+
+; ----- Send Identify -----
+.send_identify:
     lea rcx, [gw_identify_msg]
     call print_console
 
-    ; Build identify payload manually: p1 + token + p2 + intents_str + p3
+    ; Build identify payload: p1 + token + p2 + intents + p3 + activity + p4
     lea rcx, [gw_send_buf]
     lea rdx, [identify_p1]
     call asm_strcpy
@@ -268,7 +328,7 @@ gateway_connect:
     lea rdx, [identify_p2]
     call asm_strcat
 
-    ; Convert intents to string
+    ; intents -> string
     mov rcx, [rbp-16]       ; intents
     lea rdx, [gw_num_buf]
     call asm_itoa
@@ -279,6 +339,15 @@ gateway_connect:
 
     lea rcx, [gw_send_buf]
     lea rdx, [identify_p3]
+    call asm_strcat
+
+    ; presence activity text (configurable via DISCORD_ACTIVITY)
+    lea rcx, [gw_send_buf]
+    lea rdx, [g_activity]
+    call asm_strcat
+
+    lea rcx, [gw_send_buf]
+    lea rdx, [identify_p4]
     call asm_strcat
 
     ; Log payload length
@@ -292,14 +361,6 @@ gateway_connect:
     lea rdx, [gw_num_buf]
     call asm_itoa
     lea rcx, [gw_num_buf]
-    call print_console
-    lea rcx, [gw_newline]
-    call print_console
-
-    ; Dump payload content (with token masked)
-    lea rcx, [gw_payload_msg]
-    call print_console
-    lea rcx, [gw_send_buf]
     call print_console
     lea rcx, [gw_newline]
     call print_console
@@ -328,7 +389,60 @@ gateway_connect:
     call print_console
     lea rcx, [gw_newline]
     call print_console
-    jmp .done
+    ; Treat a failed send as a recoverable disconnect
+    mov qword [g_can_resume], 1
+    jmp .do_reconnect
+
+; ----- Send Resume (op 6) -----
+.send_resume:
+    lea rcx, [gw_resuming_msg]
+    call print_console
+
+    ; Build resume payload: p1 + token + p2 + session_id + p3 + seq + p4
+    lea rcx, [gw_send_buf]
+    lea rdx, [resume_p1]
+    call asm_strcpy
+
+    lea rcx, [gw_send_buf]
+    mov rdx, [rbp-8]        ; token
+    call asm_strcat
+
+    lea rcx, [gw_send_buf]
+    lea rdx, [resume_p2]
+    call asm_strcat
+
+    lea rcx, [gw_send_buf]
+    lea rdx, [g_session_id]
+    call asm_strcat
+
+    lea rcx, [gw_send_buf]
+    lea rdx, [resume_p3]
+    call asm_strcat
+
+    ; seq -> string
+    mov rcx, [g_sequence_num]
+    lea rdx, [gw_num_buf]
+    call asm_itoa
+
+    lea rcx, [gw_send_buf]
+    lea rdx, [gw_num_buf]
+    call asm_strcat
+
+    lea rcx, [gw_send_buf]
+    lea rdx, [resume_p4]
+    call asm_strcat
+
+    ; Send it
+    lea rcx, [gw_send_buf]
+    call asm_strlen
+    mov rdx, rax
+    lea rcx, [gw_send_buf]
+    call ws_send
+
+    test eax, eax
+    jnz .identify_send_fail   ; same recovery path
+
+    jmp .recv_loop
 
 ; ----- Dispatch (op 0) -----
 .handle_dispatch:
@@ -358,132 +472,84 @@ gateway_connect:
     lea rdx, [gw_event_ready]
     call asm_strcmp
     test eax, eax
-    jnz .check_message_create
+    jz .handle_ready
 
-    lea rcx, [gw_ready_msg]
-    call print_console
-    jmp .recv_loop
-
-.check_message_create:
-    ; Check for MESSAGE_CREATE
+    ; Check for RESUMED
     lea rcx, [gw_event_name_buf]
-    lea rdx, [gw_event_mc]
+    lea rdx, [gw_event_resumed]
     call asm_strcmp
     test eax, eax
-    jnz .recv_loop         ; not a message event
+    jz .handle_resumed
 
-    ; Extract message data from "d" object
-    ; Get channel_id
+    ; Otherwise: find the "d" object and hand off to the registered event table
     lea rcx, [gw_recv_buf]
     lea rdx, [key_d]
     call json_find_key
     test rax, rax
     jz .recv_loop
-    mov [rbp-40], rax      ; d object start
-
-    ; Find channel_id in d
-    mov rcx, rax
-    lea rdx, [key_channel_id]
-    call json_find_key
-    test rax, rax
-    jz .recv_loop
-
-    mov rcx, rax
-    lea rdx, [gw_channel_id_buf]
-    mov r8, MAX_CHANNEL_ID_LEN
-    call json_extract_string
-
-    ; Find id in d (message id)
-    mov rcx, [rbp-40]
-    lea rdx, [key_id]
-    call json_find_key
-    test rax, rax
-    jz .recv_loop
-
-    mov rcx, rax
-    lea rdx, [gw_message_id_buf]
-    mov r8, MAX_CHANNEL_ID_LEN
-    call json_extract_string
-
-    ; Find content in d
-    mov rcx, [rbp-40]
-    lea rdx, [key_content]
-    call json_find_key
-    test rax, rax
-    jz .recv_loop
-
-    mov rcx, rax
-    lea rdx, [gw_content_buf]
-    mov r8, MAX_MESSAGE_LEN
-    call json_extract_string
-
-    ; Find author.id in d
-    mov rcx, [rbp-40]
-    lea rdx, [key_author]
-    call json_find_key
-    test rax, rax
-    jz .dispatch_no_author
-
-    ; Check if author is a bot
-    push rax
-    mov rcx, rax
-    lea rdx, [key_bot]
-    call json_find_key
-    test rax, rax
-    jz .not_bot
-    mov rcx, rax
-    call json_extract_bool
-    test eax, eax
-    jnz .skip_bot           ; skip bot messages
-.not_bot:
-    pop rax
-
-    ; Extract ID
-    push rax
-    mov rcx, rax
-    lea rdx, [key_id]
-    call json_find_key
-    test rax, rax
-    jz .skip_id
-    mov rcx, rax
-    lea rdx, [gw_author_id_buf]
-    mov r8, 128
-    call json_extract_string
-.skip_id:
-    pop rax
-
-    ; Extract Username
-    mov rcx, rax
-    lea rdx, [key_username]
-    call json_find_key
-    test rax, rax
-    jz .dispatch_no_author
-
-    mov rcx, rax
-    lea rdx, [gw_author_buf]
-    mov r8, 128
-    call json_extract_string
-    jmp .dispatch_msg
-
-.skip_bot:
-    pop rax                 ; balance push from .not_bot path
+    mov rdx, rax                   ; d object pointer
+    lea rcx, [gw_event_name_buf]   ; event name
+    lea r8, [gw_recv_buf]          ; full payload
+    call dispatch_event
     jmp .recv_loop
 
-.dispatch_no_author:
-    mov byte [gw_author_buf], 0
-    mov byte [gw_author_id_buf], 0
+; ----- READY: capture session_id + resume_gateway_url for future RESUME -----
+.handle_ready:
+    lea rcx, [gw_recv_buf]
+    lea rdx, [key_d]
+    lea r8, [key_session_id]
+    call json_find_nested_key
+    test rax, rax
+    jz .ready_url
+    mov rcx, rax
+    lea rdx, [g_session_id]
+    mov r8, MAX_SESSION_ID_LEN
+    call json_extract_string
+    mov qword [g_can_resume], 1
 
-.dispatch_msg:
-    ; Dispatch to command system (5 args)
-    lea rax, [gw_author_id_buf]
-    mov [rsp+32], rax      ; 5th arg
-    
-    lea rcx, [gw_channel_id_buf]
-    lea rdx, [gw_content_buf]
-    lea r8, [gw_author_buf]
-    lea r9, [gw_message_id_buf]
-    call dispatch_command
+.ready_url:
+    lea rcx, [gw_recv_buf]
+    lea rdx, [key_d]
+    lea r8, [key_resume_url]
+    call json_find_nested_key
+    test rax, rax
+    jz .ready_fin
+    mov rcx, rax
+    lea rdx, [g_resume_url]
+    mov r8, MAX_RESUME_URL_LEN
+    call json_extract_string
 
+.ready_app:
+    ; Capture application id (d.application.id) for slash-command registration,
+    ; unless it was already provided via DISCORD_APP_ID env.
+    cmp byte [g_application_id], 0
+    jne .ready_register
+    lea rcx, [gw_recv_buf]
+    lea rdx, [ready_path_keys]
+    mov r8, 3
+    call json_find_path
+    test rax, rax
+    jz .ready_register
+    mov rcx, rax
+    lea rdx, [g_application_id]
+    mov r8, 64
+    call json_extract_string
+
+.ready_register:
+    ; Register slash commands once (no-op if already done / no app id)
+    call register_slash_commands_with_discord
+
+.ready_fin:
+    mov qword [g_reconnect_attempts], 0
+    lea rcx, [gw_ready_msg]
+    call print_console
+    jmp .recv_loop
+
+; ----- RESUMED: gateway accepted our resume and replayed events -----
+.handle_resumed:
+    mov qword [g_reconnect_attempts], 0
+    lea rcx, [gw_resumed_msg]
+    call print_console
     jmp .recv_loop
 
 ; ----- Heartbeat ACK (op 11) -----
@@ -535,23 +601,45 @@ gateway_connect:
 .handle_reconnect:
     lea rcx, [gw_reconnect_msg]
     call print_console
-    ; For now, just exit the loop - a production bot would reconnect
-    jmp .done
+    ; Resume if we still hold a session; otherwise reconnect fresh
+    cmp byte [g_session_id], 0
+    je .reconnect_fresh
+    mov qword [g_can_resume], 1
+    jmp .do_reconnect
+.reconnect_fresh:
+    mov qword [g_can_resume], 0
+    mov qword [g_sequence_num], -1
+    jmp .do_reconnect
 
 ; ----- Invalid Session (op 9) -----
 .handle_invalid:
     lea rcx, [gw_invalid_msg]
     call print_console
-    jmp .done
+    ; d is a boolean: true = the session is resumable, false = start over
+    lea rcx, [gw_recv_buf]
+    lea rdx, [key_d]
+    call json_find_key
+    test rax, rax
+    jz .invalid_fresh
+    mov rcx, rax
+    call json_extract_bool
+    test eax, eax
+    jz .invalid_fresh
+    ; resumable
+    mov qword [g_can_resume], 1
+    jmp .do_reconnect
+.invalid_fresh:
+    mov qword [g_can_resume], 0
+    mov byte [g_session_id], 0
+    mov qword [g_sequence_num], -1
+    jmp .do_reconnect
 
 ; ----- WebSocket CLOSE frame received -----
 .handle_close_frame:
     lea rcx, [gw_close_recv_msg]
     call print_console
-
-    ; Query the close status from WinHTTP
     call .query_close_status
-    jmp .done
+    jmp .evaluate_close
 
 ; ----- Receive error -----
 .recv_error:
@@ -585,7 +673,93 @@ gateway_connect:
 
     ; Try to query close status (may give us Discord's close code)
     call .query_close_status
-    jmp .done
+    jmp .evaluate_close
+
+; ----- Decide whether a close/error is fatal or should trigger a reconnect -----
+.evaluate_close:
+    movzx rax, word [gw_close_status]
+    cmp rax, 4004
+    je .fatal_close
+    cmp rax, 4010
+    je .fatal_close
+    cmp rax, 4011
+    je .fatal_close
+    cmp rax, 4012
+    je .fatal_close
+    cmp rax, 4013
+    je .fatal_close
+    cmp rax, 4014
+    je .fatal_close
+    ; Recoverable - try to resume (a fresh IDENTIFY will follow if it's rejected)
+    mov qword [g_can_resume], 1
+    jmp .do_reconnect
+
+.fatal_close:
+    lea rcx, [gw_fatal_msg]
+    call print_console
+    jmp .shutdown
+
+; ----- Tear down the current session and reconnect with backoff -----
+.do_reconnect:
+    call stop_heartbeat
+    call ws_close
+
+.backoff_and_retry:
+    inc qword [g_reconnect_attempts]
+    mov rax, [g_reconnect_attempts]
+    cmp rax, MAX_RECONNECT_ATTEMPTS
+    jg .give_up
+
+    ; Print "Reconnecting, attempt N"
+    lea rcx, [gw_reconnecting_msg]
+    call print_console
+    mov rcx, [g_reconnect_attempts]
+    lea rdx, [gw_num_buf]
+    call asm_itoa
+    lea rcx, [gw_num_buf]
+    call print_console
+    lea rcx, [gw_newline]
+    call print_console
+
+    ; backoff = min(BASE << (attempts-1), MAX), shift capped to keep it sane
+    mov r10, [g_reconnect_attempts]
+    dec r10
+    cmp r10, 5
+    jle .bk_shift
+    mov r10, 5
+.bk_shift:
+    mov rax, RECONNECT_BASE_MS
+    mov rcx, r10
+    shl rax, cl
+    cmp rax, RECONNECT_MAX_MS
+    jbe .bk_cap
+    mov rax, RECONNECT_MAX_MS
+.bk_cap:
+    ; Log the backoff
+    mov [rbp-72], rax
+    lea rcx, [gw_backoff_msg]
+    call print_console
+    mov rcx, [rbp-72]
+    lea rdx, [gw_num_buf]
+    call asm_itoa
+    lea rcx, [gw_num_buf]
+    call print_console
+    lea rcx, [gw_newline]
+    call print_console
+
+    mov rcx, [rbp-72]
+    call Sleep
+    jmp .connect_attempt
+
+; ws_connect failed outright - close partial handles then back off
+.connect_failed:
+    call ws_close
+    jmp .backoff_and_retry
+
+.give_up:
+    lea rcx, [gw_giveup_msg]
+    call print_console
+    jmp .shutdown
 
 ; Internal helper: query and print WebSocket close status
 .query_close_status:
@@ -682,11 +856,9 @@ gateway_connect:
     lea rcx, [gw_newline]
     call print_console
 
-.done:
-    ; Stop heartbeat
+.shutdown:
+    ; Stop heartbeat and clean up all handles
     call stop_heartbeat
-
-    ; Cleanup
     call http_cleanup
 
     mov rsp, rbp
